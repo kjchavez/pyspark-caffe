@@ -54,9 +54,9 @@ gradients = data_rdd.mapPartitions(compute_gradient)
 global_grad = gradients.reduceByKey(reduce_gradient).collect()
 
 for param, grad in global_grad:
-    print "="*50
+    print "="*80
     print param
-    print "="*50
+    print "="*80
     print grad
 
 sc.stop()
