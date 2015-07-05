@@ -6,3 +6,8 @@ We assume you already have Spark installed and running, either locally or on a c
 
 ### Running Locally
 - Install Caffe in some well known location, which we'll refer to as CAFFE\_PATH.
+
+
+## TODO
+- Update reduction of gradient/outputs to compute the average rather than the sum, especially if we're planning on doing probabilistic stale gradients
+- 

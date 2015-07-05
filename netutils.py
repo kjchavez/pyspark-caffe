@@ -1,3 +1,4 @@
+import sys
 import numpy as np
 
 
@@ -50,3 +51,23 @@ def pretty_format(param_dict):
         pretty_string += '\n'
 
     return pretty_string
+
+
+class ProgressStats:
+    @staticmethod
+    def compute_param_variance(params):
+        param_variance = {}
+        for param in params:
+            variance = np.mean(params[param]*params[param]) - \
+                          (np.mean(params[param]))**2
+            param_variance[param] = variance
+
+        return param_variance
+
+    @staticmethod
+    def compute_grad_variance(grads):
+        pass
+
+    @staticmethod
+    def eval_dev_set(params, net, minibatchRDD):
+        pass

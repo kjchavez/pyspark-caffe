@@ -5,6 +5,7 @@ import itertools
 from random import randint
 from pyspark import SparkFiles
 from pyspark import RDD
+import operator
 
 from caffe import SGDSolver
 from netutils import *
@@ -36,7 +37,7 @@ def compute_gradient(iterator, solver_filename, params, data_index):
         tic = time.time()
         set_net_params(net, params)
         net.set_input_arrays(data, label, 0)
-        net.forward()
+        outputs = net.forward()
         net.backward()
         toc = time.time()
         with open("timing.txt", 'a') as fp:
@@ -47,6 +48,10 @@ def compute_gradient(iterator, solver_filename, params, data_index):
             for idx, blob in enumerate(net.params[param]):
                 param_name = get_param_name(param, idx)
                 yield (param_name, blob.diff)
+
+        # Also yield the outputs of the network
+        for item in outputs.items():
+            yield item
 
 
 def reduce_gradient(lhs, rhs):
@@ -92,7 +97,6 @@ class CaffeNetWithSGD:
 
         # Get pre-initialized weights from Caffe
         self.weights = extract_net_params(net)
-        OUTPUT(pretty_format(self.weights))
 
         # Store training settings
         if update == 'sgd':
@@ -172,30 +176,46 @@ class CaffeNetWithSGD:
     def rms_prop_step(self, grads):
         raise NotImplementedError()
 
+    def track_progress(self, grads, outputs):
+        """Compute informative statistics about training progress. """
+        # By default, we simply track variance of parameters and loss
+        param_variance = ProgressStats.compute_param_variance(self.weights)
+        OUTPUT(param_variance)
+        OUTPUT(outputs)
+
     def train(self, minibatchRDD, iterations=100,
               initialWeights=None, staleTol=0):
-        # Step 1: Broadcast model parameters
-        # Step 2: Copy parameters to Caffe
-        # Step 3: Run Caffe on an minibatch for each partition
-        # Step 4: Collect gradients and update model
         if initialWeights is not None:
             raise NotImplementedError(
                     "Explicit weight initialization not yet supported")
 
-        weights = minibatchRDD.context.broadcast(self.weights)
-
         minibatchRDD.cache()
         solver, architecture = self.ship_prototxt_to_data(minibatchRDD)
         for i in xrange(iterations):
-            gradRDD = minibatchRDD.mapPartitions(
-                          lambda x: compute_gradient(x, solver, weights.value, i))
-            global_grads = gradRDD \
+            # Step 1: Broadcast model parameters
+            weights = minibatchRDD.context.broadcast(self.weights)
+
+            # Step 2: Run Caffe on an minibatch for each partition
+            grads_output_rdd = minibatchRDD.mapPartitions(
+                        lambda x: compute_gradient(x, solver, weights.value, i))
+
+            # Step 3: Reduce gradients to driver
+            net_params = self.weights.keys()
+            global_grads = grads_output_rdd \
+                .filter(lambda x: x[0] in net_params) \
                 .map(lambda x: ((x[0], randint(0, staleTol)), x[1])) \
                 .reduceByKey(reduce_gradient) \
                 .collectAsMap()
 
-            # Global grads are now on driver as dictionary
-            OUTPUT(global_grads)
+            global_outputs = grads_output_rdd \
+                .filter(lambda x: x[0] not in net_params) \
+                .reduceByKey(operator.add) \
+                .collectAsMap()
+
+            # Step 4: Update model on driver
             self.update_fn(global_grads)
+
+            # Step 5: (Optionally) Record some progress metrics
+            self.track_progress(global_grads, global_outputs)
 
         return
