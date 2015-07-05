@@ -203,14 +203,26 @@ class CaffeNetWithSGD:
             net_params = self.weights.keys()
             global_grads = grads_output_rdd \
                 .filter(lambda x: x[0] in net_params) \
-                .map(lambda x: ((x[0], randint(0, staleTol)), x[1])) \
-                .reduceByKey(reduce_gradient) \
+                .map(lambda x: ((x[0], randint(0, staleTol)), (x[1], 1))) \
+                .reduceByKey(lambda x, y: (x[0] + y[0], x[1] + y[1])) \
                 .collectAsMap()
+
+            for name, (grad_sum, count) in global_grads.items():
+                global_grads[name] = grad_sum
+                global_grads[name] /= count
+
+                #.reduceByKey(reduce_gradient) \
+                #.collectAsMap()
 
             global_outputs = grads_output_rdd \
                 .filter(lambda x: x[0] not in net_params) \
-                .reduceByKey(operator.add) \
+                .mapValues(lambda x: (x, 1)) \
+                .reduceByKey(lambda x, y: (x[0] + y[0], x[1] + y[1])) \
                 .collectAsMap()
+
+            for name, (grad_sum, count) in global_outputs.items():
+                global_outputs[name] = grad_sum
+                global_outputs[name] /= count
 
             # Step 4: Update model on driver
             self.update_fn(global_grads)
