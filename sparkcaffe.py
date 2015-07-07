@@ -1,11 +1,12 @@
 import sys
+import os
 import numpy as np
 import time
 import itertools
 from random import randint
 from pyspark import SparkFiles
 from pyspark import RDD
-import operator
+from pyspark import StorageLevel
 
 from caffe import SGDSolver
 from netutils import *
@@ -29,7 +30,12 @@ def compute_gradient(iterator, solver_filename, params, data_index):
     with open("timing.txt", 'a') as fp:
         print >> fp, "Caffe setup overhead = %0.2f ms" % (1000*(toc - tic))
 
+    tic = time.time()
     data, label = nth(iterator, data_index, default=(None, None))
+    toc = time.time()
+    with open("timing.txt", 'a') as fp:
+        print >> fp, "Advancing iterator = %0.2f ms" % (1000*(toc - tic))
+
     if data is None:
         yield (None, None)
 
@@ -44,14 +50,22 @@ def compute_gradient(iterator, solver_filename, params, data_index):
             print >> fp, "Caffe compute time = %0.2f ms" % (1000*(toc - tic))
 
         # Extract and return gradients as dict
+        tic = time.time()
         for param in net.params:
             for idx, blob in enumerate(net.params[param]):
                 param_name = get_param_name(param, idx)
                 yield (param_name, blob.diff)
+        toc = time.time()
+        with open("timing.txt", 'a') as fp:
+            print >> fp, "Caffe yield param time = %0.2f ms" % (1000*(toc - tic))
 
         # Also yield the outputs of the network
+        tic = time.time()
         for item in outputs.items():
             yield item
+        toc = time.time()
+        with open("timing.txt", 'a') as fp:
+            print >> fp, "Caffe yield output = %0.2f ms" % (1000*(toc - tic))
 
 
 def reduce_gradient(lhs, rhs):
@@ -76,7 +90,8 @@ class CaffeNetWithSGD:
     def __init__(self, solver_prototxt, architecture_prototxt,
                  input_blob="data-label", score_blob="score",
                  update='sgd',
-                 learning_rate=1e-4):
+                 learning_rate=1e-4,
+                 log_dir="log-sparknet"):
 
         net = SGDSolver(solver_prototxt).net
         self.batch_shape = net.blobs.values()[0].data.shape
@@ -109,6 +124,11 @@ class CaffeNetWithSGD:
             raise ValueError("Update algorithm %s not supported." % update)
 
         self.learning_rate = learning_rate
+
+        self.log_dir = log_dir
+        if not os.path.isdir(log_dir):
+            os.makedirs(log_dir)
+
 
     def group_by_minibatch(self, dataRDD):
         return dataRDD.mapPartitions(
@@ -180,8 +200,18 @@ class CaffeNetWithSGD:
         """Compute informative statistics about training progress. """
         # By default, we simply track variance of parameters and loss
         param_variance = ProgressStats.compute_param_variance(self.weights)
-        OUTPUT(param_variance)
-        OUTPUT(outputs)
+        with open(os.path.join(self.log_dir, 'outputs.txt'), 'a') as fp:
+            for name in outputs:
+                print >> fp, name + ":", outputs[name]
+
+        with open(os.path.join(self.log_dir, 'param-var.txt'), 'a') as fp:
+            for name in param_variance:
+                print >> fp, name + ":", param_variance[name]
+
+        grad_variance = ProgressStats.compute_grad_variance(grads)
+        with open(os.path.join(self.log_dir, 'grad-var.txt'), 'a') as fp:
+            for name in grad_variance:
+                print >> fp, name + ":", grad_variance[name]
 
     def train(self, minibatchRDD, iterations=100,
               initialWeights=None, staleTol=0):
@@ -189,45 +219,62 @@ class CaffeNetWithSGD:
             raise NotImplementedError(
                     "Explicit weight initialization not yet supported")
 
-        minibatchRDD.cache()
+        minibatchRDD.persist(storageLevel=StorageLevel.MEMORY_ONLY)
         solver, architecture = self.ship_prototxt_to_data(minibatchRDD)
         for i in xrange(iterations):
+            loop_tic = time.time()
             # Step 1: Broadcast model parameters
             weights = minibatchRDD.context.broadcast(self.weights)
+            toc = time.time()
+            OUTPUT("Broadcast time: %0.2f ms" % (1000*(toc-loop_tic)))
 
             # Step 2: Run Caffe on an minibatch for each partition
             grads_output_rdd = minibatchRDD.mapPartitions(
                         lambda x: compute_gradient(x, solver, weights.value, i))
+            grads_output_rdd.persist(storageLevel=StorageLevel.MEMORY_ONLY)
 
             # Step 3: Reduce gradients to driver
+            # NOTE: I think the problem is reduceByKey creates intermediate
+            # objects to hold results of addition, i.e., too many memory allocs
             net_params = self.weights.keys()
             global_grads = grads_output_rdd \
                 .filter(lambda x: x[0] in net_params) \
-                .map(lambda x: ((x[0], randint(0, staleTol)), (x[1], 1))) \
+                .map(lambda x: ((x[0], randint(0, staleTol)), (x[1], 1)),
+                     preservesPartitioning=True) \
                 .reduceByKey(lambda x, y: (x[0] + y[0], x[1] + y[1])) \
                 .collectAsMap()
+            toc = time.time()
+            OUTPUT("Time to global_grads: %0.2f ms" % (1000*(toc - loop_tic)))
 
+            tic = time.time()
             for name, (grad_sum, count) in global_grads.items():
                 global_grads[name] = grad_sum
                 global_grads[name] /= count
+            toc = time.time()
+            OUTPUT("Normalize grads: %0.2f ms" % (1000*(toc-tic)))
 
-                #.reduceByKey(reduce_gradient) \
-                #.collectAsMap()
-
+            tic = time.time()
             global_outputs = grads_output_rdd \
                 .filter(lambda x: x[0] not in net_params) \
                 .mapValues(lambda x: (x, 1)) \
                 .reduceByKey(lambda x, y: (x[0] + y[0], x[1] + y[1])) \
                 .collectAsMap()
+            toc = time.time()
+            OUTPUT("Collect loss: %0.2f ms" % (1000*(toc-tic)))
 
-            for name, (grad_sum, count) in global_outputs.items():
-                global_outputs[name] = grad_sum
+            for name, (output_sum, count) in global_outputs.items():
+                global_outputs[name] = np.squeeze(output_sum)
                 global_outputs[name] /= count
 
             # Step 4: Update model on driver
+            tic_ = time.time()
             self.update_fn(global_grads)
+            toc_ = time.time()
+            OUTPUT("Driver-side update time: %0.2f ms" % (1000*(toc_-tic_)))
 
             # Step 5: (Optionally) Record some progress metrics
             self.track_progress(global_grads, global_outputs)
+            loop_toc = time.time()
+            OUTPUT("Iteration time: %0.2f ms" % (1000*(loop_toc-loop_tic)))
 
         return

@@ -66,7 +66,13 @@ class ProgressStats:
 
     @staticmethod
     def compute_grad_variance(grads):
-        pass
+        grad_variance = {}
+        for (param, idx), gradient in grads.items():
+            variance = np.mean(gradient*gradient) - \
+                          (np.mean(gradient))**2
+            grad_variance[param] = variance
+
+        return grad_variance
 
     @staticmethod
     def eval_dev_set(params, net, minibatchRDD):

@@ -9,5 +9,4 @@ We assume you already have Spark installed and running, either locally or on a c
 
 
 ## TODO
-- Update reduction of gradient/outputs to compute the average rather than the sum, especially if we're planning on doing probabilistic stale gradients
 - 

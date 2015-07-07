@@ -28,6 +28,6 @@ barista = CaffeNetWithSGD("models/solver.prototxt",
                           "models/train_val.prototxt")
 
 minibatch_rdd = barista.group_by_minibatch(data_rdd)
-barista.train(minibatch_rdd, iterations=3)
+barista.train(minibatch_rdd, iterations=10)
 
 sc.stop()
